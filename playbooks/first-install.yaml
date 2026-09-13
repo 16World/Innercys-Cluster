@@ -1,0 +1,199 @@
+---
+- name: First install - Innercys cluster node
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    tailscale_auth_key: ""
+    moosefs_master: "mfsmaster"
+    moosefs_mount: "/mnt/mfs"
+    root_authorized_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICwyR3lVXdm1NutBfDpPjVwowDGunn2kTvjf2oqsV3Nu mbp"
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILLcMG5ZrtDn+uTgrctVyYQCcWL7Iqbyk4RV8oGZnswb farm"
+
+  pre_tasks:
+    - name: Validate supported platform
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Debian"
+          - ansible_facts.architecture in ["aarch64", "arm64"]
+        fail_msg: >-
+          This playbook supports Debian-family hosts on ARM64 only.
+
+    - name: Show detected platform
+      ansible.builtin.debug:
+        msg:
+          - "OS: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}"
+          - "Architecture: {{ ansible_facts.architecture }}"
+
+  tasks:
+    - name: Install bootstrap packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Configure root SSH directory
+      ansible.builtin.file:
+        path: /root/.ssh
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Configure root authorized keys
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ item }}"
+        state: present
+        manage_dir: false
+      loop: "{{ root_authorized_keys }}"
+
+    - name: Check whether Tailscale is installed
+      ansible.builtin.command: tailscale version
+      register: tailscale_version
+      changed_when: false
+      failed_when: false
+
+    - name: Install Tailscale
+      ansible.builtin.shell: curl -fsSL https://tailscale.com/install.sh | sh
+      args:
+        executable: /bin/bash
+      when: tailscale_version.rc != 0
+
+    - name: Enable and start Tailscale
+      ansible.builtin.systemd_service:
+        name: tailscaled
+        enabled: true
+        state: started
+
+    - name: Check Tailscale connection
+      ansible.builtin.command: tailscale status
+      register: tailscale_status
+      changed_when: false
+      failed_when: false
+
+    - name: Validate Tailscale auth key when connection is needed
+      ansible.builtin.assert:
+        that:
+          - tailscale_auth_key | length > 0
+        fail_msg: >-
+          Set tailscale_auth_key as a Semaphore extra variable or secret.
+      when: tailscale_status.rc != 0
+
+    - name: Connect Tailscale
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - up
+          - "--auth-key={{ tailscale_auth_key }}"
+      no_log: true
+      when: tailscale_status.rc != 0
+
+    - name: Check whether Docker is installed
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker
+      ansible.builtin.shell: curl -fsSL https://get.docker.com | sh
+      args:
+        executable: /bin/bash
+      when: docker_version.rc != 0
+
+    - name: Enable and start Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Ensure APT keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download MooseFS repository key
+      ansible.builtin.get_url:
+        url: https://repository.moosefs.com/moosefs.key
+        dest: /tmp/moosefs.key
+        mode: "0644"
+      register: moosefs_key
+
+    - name: Check MooseFS repository keyring
+      ansible.builtin.stat:
+        path: /etc/apt/keyrings/moosefs.gpg
+      register: moosefs_keyring
+
+    - name: Convert MooseFS repository key to keyring format
+      ansible.builtin.command:
+        cmd: gpg --dearmor --yes --output /etc/apt/keyrings/moosefs.gpg /tmp/moosefs.key
+      when: moosefs_key.changed or not moosefs_keyring.stat.exists
+
+    - name: Set MooseFS repository key permissions
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/moosefs.gpg
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Configure MooseFS repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=arm64 signed-by=/etc/apt/keyrings/moosefs.gpg] http://repository.moosefs.com/moosefs-5/apt/debian/trixie trixie main"
+        filename: moosefs
+        state: present
+        update_cache: true
+
+    - name: Install MooseFS client and chunkserver
+      ansible.builtin.apt:
+        name:
+          - moosefs-pro-chunkserver
+          - moosefs-pro-client
+        state: present
+
+    - name: Create MooseFS mount directory
+      ansible.builtin.file:
+        path: "{{ moosefs_mount }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure MooseFS mount in fstab
+      ansible.posix.mount:
+        path: "{{ moosefs_mount }}"
+        src: "{{ moosefs_master }}:/mnt/mfs"
+        fstype: moosefs
+        opts: defaults,_netdev,noauto,x-systemd.automount,mfsdelayedinit
+        dump: "0"
+        passno: "0"
+        state: present
+
+    - name: Mount MooseFS
+      ansible.posix.mount:
+        path: "{{ moosefs_mount }}"
+        src: "{{ moosefs_master }}:/mnt/mfs"
+        fstype: moosefs
+        opts: defaults,_netdev,noauto,x-systemd.automount,mfsdelayedinit
+        state: mounted
+
+    - name: Verify Docker is healthy
+      ansible.builtin.command: docker info
+      changed_when: false
+
+    - name: Verify MooseFS mount
+      ansible.builtin.command: "findmnt {{ moosefs_mount }}"
+      changed_when: false
+
+    - name: Display node summary
+      ansible.builtin.debug:
+        msg:
+          - "MooseFS mount: {{ moosefs_mount }}"
+          - "Docker: {{ docker_version.stdout | default('installed during this run') }}"
